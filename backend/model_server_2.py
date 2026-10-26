@@ -1,35 +1,35 @@
-from flask import Flask, request, jsonify
-import boto3
+import os
 import json
+import boto3
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)  # Crucial for allowing requests from your frontend
+
+# Initialize Bedrock client once globally rather than inside every request
+brt = boto3.client(
+    service_name='bedrock-runtime',
+    region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+)
+
+SYSTEM_PROMPT = """You are an expert Principal Software Engineer and Code Assistant.
+Follow these engineering guidelines:
+1. Provide production-ready, clean, modular, and idiomatic code.
+2. Include type hints, edge-case validation, and concise docstrings.
+3. Keep conversational filler to a minimum: present the solution, explain key architectural decisions briefly, and mention time/space complexity if algorithmic.
+4. If an image (diagram, error screenshot, UI mockup) is provided, diagnose the visual contents directly before writing the implementation."""
 
 @app.route('/process', methods=['POST'])
 def process():
-    data = request.json
-    message = data.get('message')
-    image = data.get('image')
+    data = request.json or {}
+    message = data.get('message', '')
+    image = data.get('image')  # Expects base64-encoded string
 
-    # Initialize Bedrock client
-    brt = boto3.client(service_name='bedrock-runtime', region_name='us-east-1')
-
-    # Combine system prompt + user message
-    system_instruction = "You're a senior developer assistant. Always respond with clean, well-commented code."
-
-    # Add instruction to consider image
+    # Assemble user content blocks
+    user_content = []
     if image:
-        message = f"{system_instruction}\n\n{message}\n\nPlease refer to the attached image and consider it while answering."
-    else:
-        message = f"{system_instruction}\n\n{message}"
-
-    # Build user prompt with optional image
-    user_prompt = {
-        "role": "user",
-        "content": []
-    }
-
-    if image:
-        user_prompt["content"].append({
+        user_content.append({
             "type": "image",
             "source": {
                 "type": "base64",
@@ -37,13 +37,9 @@ def process():
                 "data": image
             }
         })
+    user_content.append({"type": "text", "text": message})
 
-    user_prompt["content"].append({
-        "type": "text",
-        "text": message
-    })
-
-    # Few-shot examples to help Claude understand the style
+    # High-quality few-shot examples demonstrating typing, docstrings, and edge handling
     few_shot_messages = [
         {
             "role": "user",
@@ -51,63 +47,57 @@ def process():
         },
         {
             "role": "assistant",
-            "content": [{"type": "text", "text":
-                '''
-                ```python
-def is_prime(n):
-    """
-    Check if a number is prime.
-    A prime number is greater than 1 and only divisible by 1 and itself.
-    """
-    if n <= 1:
-        return False
-    for i in range(2, int(n**0.5) + 1):
-        if n % i == 0:
-            return False
-    return True
-```'''}]
-        },
-        {
-            "role": "user",
-            "content": [{"type": "text", "text": "Create a Flask endpoint to return current server time in JSON."}]
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text":
-                '''```python
-from flask import Flask, jsonify
-from datetime import datetime
-
-app = Flask(__name__)
-
-@app.route('/time')
-def get_time():
-    # Return current server time in JSON
-    return jsonify({"server_time": datetime.now().isoformat()})
-```'''}]
+            "content": [{
+                "type": "text",
+                "text": (
+                    "```python\n"
+                    "def is_prime(n: int) -> bool:\n"
+                    "    \"\"\"Determine whether an integer is prime using 6k +/- 1 trial division.\"\"\"\n"
+                    "    if n <= 1:\n"
+                    "        return False\n"
+                    "    if n <= 3:\n"
+                    "        return True\n"
+                    "    if n % 2 == 0 or n % 3 == 0:\n"
+                    "        return False\n\n"
+                    "    i = 5\n"
+                    "    while i * i <= n:\n"
+                    "        if n % i == 0 or n % (i + 2) == 0:\n"
+                    "            return False\n"
+                    "        i += 6\n"
+                    "    return True\n"
+                    "```\n\n"
+                    "**Complexity:** Time: $O(\\sqrt{n})$ | Space: $O(1)$"
+                )
+            }]
         }
     ]
 
-    # Compose the final body for the API call
+    # Use the native 'system' parameter in the Anthropic payload
     body = {
         "anthropic_version": "bedrock-2023-05-31",
-        "max_tokens": 1000,
-        "messages": few_shot_messages + [user_prompt]
+        "max_tokens": 2048,
+        "temperature": 0.2,  # Lower temperature produces tighter, more deterministic code
+        "system": SYSTEM_PROMPT,
+        "messages": few_shot_messages + [{"role": "user", "content": user_content}]
     }
 
-    # Model call
-    model_id = "anthropic.claude-3-sonnet-20240229-v1:0"
-    response = brt.invoke_model(
-        modelId=model_id,
-        body=json.dumps(body),
-        contentType="application/json",
-        accept="application/json"
-    )
+    try:
+        model_id = "anthropic.claude-3-sonnet-20240229-v1:0"
+        response = brt.invoke_model(
+            modelId=model_id,
+            body=json.dumps(body),
+            contentType="application/json",
+            accept="application/json"
+        )
 
-    # Parse the response
-    response_body = json.loads(response['body'].read())
-    text_content = response_body['content'][0]['text']
-    return jsonify({'reply': text_content})
+        response_body = json.loads(response['body'].read())
+        text_content = response_body['content'][0]['text']
+        return jsonify({'reply': text_content})
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
-    app.run(port=8000, debug=True)
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, debug=True)
